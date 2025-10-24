@@ -12,9 +12,24 @@ from logging.handlers import TimedRotatingFileHandler
 from datetime import datetime
 
 from PyQt5.QtWidgets import QApplication
-#from PyQt5.QtCore import QCoreApplication
+from PyQt5.QtCore import QCoreApplication
 from PyQt5.QtCore import qInstallMessageHandler
+from telegram_bot import start_telegram_listener_async
 
+
+def start_telegram_listener_background():
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(None, lambda: asyncio.run(start_telegram_listener_async()))
+
+
+def trigger_telegram_shutdown():
+    from telegram_bot import telegram_stop_event, set_telegram_flag
+    if telegram_stop_event is not None:
+        telegram_stop_event.set()
+        T.info("[TELEGRAM] Shutdown signal triggered from GUI exit.")
+
+
+############ Thsee are to suppress QSokcet console outputs ######
 # Save the original __init__
 _orig_init = QSocketNotifier.__init__
 
@@ -28,6 +43,7 @@ def qt_message_handler(mode, context, message):
     pass
     
 qInstallMessageHandler(qt_message_handler)
+###################################################################
 
 from gui import create_gui, handle_autostart
 from detection import shutdown_detection_pipeline
@@ -108,7 +124,7 @@ def run_watchdog():
     global watchdog_thread, watchdog_stop_event
 
     from detection import launch_detection, detection_thread, detection_active_event
-    from telegram_bot import telegram_bot_running  # async flag only
+    from telegram_bot import is_telegram_running
 
     T.debug("[👁️] Watchdog started.")
 
@@ -116,7 +132,7 @@ def run_watchdog():
         # ---------------------------------------------------------
         # 1. Check Telegram bot health (async version)
         # ---------------------------------------------------------
-        if not telegram_bot_running:
+        if not is_telegram_running():
             T.warning("Telegram bot not running (async). Manual restart may be required.")
 
         # ---------------------------------------------------------
@@ -149,11 +165,15 @@ def main_entry():
         app = QApplication(sys.argv)
         loop = QEventLoop(app)
         asyncio.set_event_loop(loop)
+        
+        app.aboutToQuit.connect(trigger_telegram_shutdown)
+
         # ---------------------------------------------------------
         # 3. Launch Telegram bot inside the unified asyncio loop
         # ---------------------------------------------------------
-        from telegram_bot import start_telegram_listener_async, stop_telegram_listener_async
-        loop.create_task(start_telegram_listener_async())
+        from telegram_bot import stop_telegram_listener_async
+        start_telegram_listener_background()
+
         app.aboutToQuit.connect(lambda: loop.create_task(stop_telegram_listener_async()))
         # ---------------------------------------------------------
         # 4. Initialize GUI and widgets
@@ -172,6 +192,8 @@ def main_entry():
         # ---------------------------------------------------------
         # 6. Enter the unified Qt + asyncio event loop
         # ---------------------------------------------------------
+        app.aboutToQuit.connect(loop.stop)
+
         with loop:
             T.info("Starting unified Qt/asyncio event loop...")
             loop.run_forever()
@@ -187,7 +209,9 @@ def main_entry():
         # 7. Graceful shutdown of Telegram bot
         # ---------------------------------------------------------
         try:
-            loop.run_until_complete(stop_telegram_listener_async())
+            watchdog_stop_event.set()
+            if watchdog_thread and watchdog_thread.is_alive():
+                watchdog_thread.join(timeout=5)
         except (asyncio.CancelledError, RuntimeError) as e:
             T.warning("Telegram internal tasks cancelled during shutdown (normal).")
         except Exception as e:

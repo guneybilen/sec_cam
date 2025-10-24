@@ -5,9 +5,7 @@ import tracelog as T
 import subprocess
 from datetime import datetime, timedelta
 from contextlib import contextmanager
-from moviepy import VideoFileClip
 import cv2
-import shutil
 from pathlib import Path
 from imageio_ffmpeg import get_ffmpeg_exe
 

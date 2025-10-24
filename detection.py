@@ -8,14 +8,16 @@ import numpy as np
 from datetime import datetime
 from contextlib import contextmanager # Import contextmanager
 import asyncio
-
+import subprocess
 
 # from PyQt5.QtCore import Qt
 # from PyQt5.QtGui import QImage, QPixmap
-
 # from utils import open_video_writer, compress_video, gui_after
 # from gui import safe_imshow, update_cooldown_label, update_gui_idle_state
 # from notifications import send_alerts_async, send_telegram_error_alert
+
+from PyQt5.QtWidgets import QMessageBox, QApplication
+from PyQt5.QtCore import Qt
 
 # Global Variables
 cap = None  # Camera capture object
@@ -28,6 +30,18 @@ manual_shutdown_requested = False   # ✅ new flag
 _preview_enabled = True
 _preview_last_ts = 0.0
 _preview_min_interval = 0.08  # ~12.5 FPS equivalent; avoid spamming GUI
+_sudo_shutdown_lock = threading.Lock()
+_sudo_shutdown_flag = False
+
+def set_sudo_shutdown_in_progress(value: bool):
+    global _sudo_shutdown_flag
+    with _sudo_shutdown_lock:
+        _sudo_shutdown_flag = value
+
+def get_sudo_shutdown_in_progress() -> bool:
+    with _sudo_shutdown_lock:
+        return _sudo_shutdown_flag
+
 
 def _gui_post(func, *args, **kwargs):
     """
@@ -253,14 +267,43 @@ def open_camera(index=0):
         # It MUST be released in the main_entry's finally block OR
         # the detection thread's finally block to avoid premature release.
         pass
+     
+def show_spinner():
+    try:
+        from gui import cooldown_label as status_label
+        if status_label:
+            status_label.setText("🔄 Waiting for authorization...")
+    except Exception as e:
+        T.warning(f"Spinner failed: {e}")
 
-def shutdown_detection_pipeline(remote=False):
-    """
-    Stops the motion detection pipeline.
-    """
-    global detection_active_event, detection_thread, manual_shutdown_requested
+def hide_spinner():
+    try:
+        from gui import cooldown_label as status_label
+        if status_label:
+            status_label.setText("")
+    except Exception as e:
+        T.warning(f"Spinner hide failed: {e}")
+
+        
+def disable_stop_button():
+    from gui import stop_button
+    if stop_button:
+        stop_button.setEnabled(False)
+
+def enable_stop_button():
+    from gui import stop_button
+    if stop_button:
+        stop_button.setEnabled(True)
+        
+            
+def _shutdown_after_user_confirmation():
+    from gui import enqueue_gui
+    enqueue_gui(disable_stop_button)
+    enqueue_gui(show_spinner)
+    
+    global detection_thread, manual_shutdown_requested, sudo_shutdown_in_progress
     manual_shutdown_requested = True
-    detection_active_event.clear()
+    set_sudo_shutdown_in_progress(False)
     T.info("[🛑] Detection flag set to False.")
 
     if detection_thread and detection_thread.is_alive():
@@ -269,11 +312,8 @@ def shutdown_detection_pipeline(remote=False):
             T.warning("Detection thread failed to join gracefully.")
             try:
                 from gui import enqueue_gui, cooldown_label, gui_after
-                if not remote and cooldown_label:
-                    # Thread‑safe warning label update
+                if cooldown_label:
                     enqueue_gui(lambda: cooldown_label.setText("⚠️ Detection thread hang"))
-
-                    # Clear warning after 10s, also thread‑safe
                     gui_after(10000, lambda: enqueue_gui(
                         lambda: cooldown_label.setText("") if cooldown_label else None
                     ))
@@ -282,7 +322,6 @@ def shutdown_detection_pipeline(remote=False):
 
     detection_thread = None
 
-    # Thread‑safe idle update
     try:
         from gui import gui_exists, enqueue_gui, update_gui_idle_state
         if gui_exists():
@@ -295,6 +334,100 @@ def shutdown_detection_pipeline(remote=False):
     T.info("Motion detection stopped.")
     detection_active_event.clear()
 
+"""
+def _run_sudo_shutdown_worker():
+    global detection_active_event, sudo_shutdown_in_progress
+    try:
+        subprocess.run(["sudo", "-k"], check=True)
+        subprocess.run(["xterm", "-e", "sudo ./stop_detector_secure.sh"])
+        T.info("[SECURITY] Sudo shutdown succeeded.")
+        detection_active_event.clear()
+    except Exception as e:
+        T.error(f"[SECURITY] Shutdown error: {e}\n{traceback.format_exc()}")
+        detection_active_event.set()
+    finally:
+        set_sudo_shutdown_in_progress(False)
+        enqueue_gui(hide_spinner)
+        enqueue_gui(enable_stop_button)
+def _run_sudo_shutdown_main_thread():
+    enqueue_gui(show_spinner)
+    T.info("[THREAD] Launching sudo shutdown thread")
+    t = threading.Thread(target=_run_sudo_shutdown_worker, name="SudoShutdownThread")
+    t.start()
+"""
+
+
+def show_sudo_info_popup(*args, **kwargs):
+    global sudo_info_popup
+    T.info("[UI] Showing sudo info popup")
+
+    app = QApplication.instance()
+    if not app:
+        T.warning("No QApplication instance found.")
+        return
+
+    msg = QMessageBox()
+    msg.setIcon(QMessageBox.Information)
+    msg.setWindowTitle("Authorization Required")
+    msg.setText("🔐 Please authorize the shutdown.\n\nA system prompt will appear asking for your password.")
+    msg.setStandardButtons(QMessageBox.Ok)
+    msg.setDefaultButton(QMessageBox.Ok)
+    msg.setWindowModality(Qt.ApplicationModal)
+
+    # Center the message box
+    screen = app.primaryScreen()
+    screen_geometry = screen.availableGeometry()
+    msg_geometry = msg.frameGeometry()
+    center_point = screen_geometry.center()
+    msg_geometry.moveCenter(center_point)
+    msg.move(msg_geometry.topLeft())
+
+    sudo_info_popup = msg
+    msg.raise_()
+    msg.activateWindow()
+
+    result = msg.exec_()
+    if result != QMessageBox.Ok:
+        T.info("User cancelled shutdown.")
+        return
+
+    # ✅ Run sudo in a background thread to keep GUI responsive
+    def run_sudo_in_terminal():
+        try:
+            T.info("[SECURITY] Launching sudo in terminal")
+            subprocess.run(["sudo", "-k"], check=True)
+            subprocess.run(["gnome-terminal","--","bash","-c","sudo ./stop_detector_secure.sh"], check=True)
+            T.info("[SECURITY] Sudo shutdown succeeded.")
+            set_sudo_shutdown_in_progress(False)
+            detection_active_event.clear()
+        except subprocess.CalledProcessError as e:
+            T.error(f"[SECURITY] Sudo authorization failed: {e}")
+            detection_active_event.set()
+        except Exception as e:
+            T.error(f"[SECURITY] Unexpected error during sudo escalation: {e}")
+            detection_active_event.set()
+        finally:
+            from gui import enqueue_gui
+            set_sudo_shutdown_in_progress(False)
+            enqueue_gui(hide_spinner)
+            enqueue_gui(enable_stop_button)
+            _shutdown_after_user_confirmation()
+
+    threading.Thread(target=run_sudo_in_terminal, name="SudoTerminalThread").start()
+
+
+def shutdown_detection_pipeline(skip_auth=False):
+    global sudo_shutdown_in_progress
+    if not skip_auth:
+        if get_sudo_shutdown_in_progress():
+            T.warning("Shutdown already in progress — ignoring duplicate request.")
+            return False
+
+        set_sudo_shutdown_in_progress(True)
+        _gui_post(show_sudo_info_popup)  # Show popup and run sudo after confirmation
+        return True
+           
+              
 def main():
     """Main motion detection loop running in a background thread."""
     from gui import gui_exists
@@ -336,8 +469,11 @@ def main():
             )
         else:
             T.info("Detection stopped manually — no Telegram error alert sent.")
-            manual_shutdown_requested = False  # reset for next run
-
+         
+        # ✅ Always reset shutdown flags
+        manual_shutdown_requested = False  # reset for next run
+        set_sudo_shutdown_in_progress (False)  # ✅ Reset here
+        
         # Thread-safe GUI idle update
         try:
             from gui import gui_exists, enqueue_gui, update_gui_idle_state

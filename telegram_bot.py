@@ -5,6 +5,7 @@ import tracelog as T
 from telegram.ext import Application, CommandHandler, ContextTypes
 from notifications import send_telegram_alert
 from dotenv import load_dotenv
+from telegram.ext import ApplicationBuilder
 import os
 
 
@@ -26,6 +27,7 @@ telegram_bot_running = False
 telegram_loop = None  # Reference to the asyncio event loop for clean shutdown
 telegram_thread = None
 last_motion_time = None
+telegram_stop_event: asyncio.Event | None = None
 
 
 def set_telegram_flag(value: bool):
@@ -34,6 +36,11 @@ def set_telegram_flag(value: bool):
     telegram_bot_running = value
     T.info(f"[DEBUG] telegram_bot_running set to {value}")
     # traceback.print_stack(limit=4)  # show who called this
+    
+
+def is_telegram_running():
+    return telegram_bot_running
+
 
 from gui import enqueue_gui, update_telegram_status_label
 enqueue_gui(update_telegram_status_label)
@@ -76,6 +83,7 @@ async def start_command(update, context):
             f"Unauthorized access. Your chat ID ({chat_id}) is being logged. Expected ID: {expected_id}"
         )
 
+
 async def stop_command(update, context):
     """Handles the /stop_detector command from Telegram."""
     from detection import shutdown_detection_pipeline, detection_active_event
@@ -103,7 +111,7 @@ async def stop_command(update, context):
             "Motion detector stopped remotely."
         )
     else:
-        T.eror("\n[❌] Chat ID Unauthorized.")
+        T.error("\n[❌] Chat ID Unauthorized.")
         T.warning(f"Unauthorized stop attempt from chat ID: {chat_id}")
         await update.message.reply_text(
             f"Unauthorized access. Your chat ID ({chat_id}) is being logged."
@@ -211,7 +219,6 @@ async def summary_command(update, context):
 
 
 # --- Telegram Bot Setup and Control ---
-
 def _build_telegram_app():
     """Builds and configures the Telegram application."""
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -221,25 +228,19 @@ def _build_telegram_app():
     app.add_handler(CommandHandler("summary", summary_command))
     return app
 
+
 async def _shutdown_telegram_app(app):
     """Stops the Telegram application cleanly."""
     from gui import update_telegram_status_label
-    global telegram_bot_running
 
     if app and getattr(app, "running", False):
         T.info("[🛑] Stopping Telegram polling...")
         await app.updater.stop()  # ✅ Stop polling first
-
         T.info("[🛑] Stopping Telegram app...")
         await app.stop()  # ✅ Then stop the app
-
         T.info("[🛑] Shutting down Telegram app...")
         await app.shutdown()  # ✅ Finally shut down resources
-
         set_telegram_flag(False)
-
-        from gui import gui_after
-        # gui_after(0, update_telegram_status_label)
         update_telegram_status_label()
         T.info("[✅] Telegram bot shutdown complete.")
     T.info("[✅] Telegram application stopped.")
@@ -248,15 +249,15 @@ async def _shutdown_telegram_app(app):
 async def stop_telegram_bot():
     """Stop Telegram bot cleanly."""
     from gui import update_telegram_status_label
-    global telegram_app, telegram_bot_running
+    global telegram_app
 
     if not telegram_app:
         return
 
     try:
-        telegram_app.stop()         # ✅ stop run_polling
-        await telegram_app.shutdown()
         set_telegram_flag(False)
+        await telegram_app.stop()         # ✅ stop run_polling
+        await telegram_app.shutdown()
         enqueue_gui(update_telegram_status_label)
         T.info("[🛑] Telegram bot stopped cleanly.")
     except asyncio.CancelledError:
@@ -266,15 +267,12 @@ async def stop_telegram_bot():
     finally:
         telegram_app = None
 
-telegram_bot_running = False
-telegram_stop_event: asyncio.Event | None = None
-
 async def start_telegram_listener_async():
     global telegram_bot_running, telegram_stop_event
     try:
         app = _build_telegram_app()
 
-        telegram_bot_running = True
+        set_telegram_flag(True)
         from gui import enqueue_gui, update_telegram_status_label
         enqueue_gui(update_telegram_status_label)
 
@@ -297,16 +295,19 @@ async def start_telegram_listener_async():
             await app.updater.stop()
             await app.stop()
             await app.shutdown()
+            set_telegram_flag(False)
         except Exception as e:
             T.error(f"Telegram shutdown error: {e}")
 
-        telegram_bot_running = False
         from gui import enqueue_gui, update_telegram_status_label
         enqueue_gui(update_telegram_status_label)
+
 
 async def stop_telegram_listener_async():
     """Signal the Telegram bot to shut down gracefully."""
     global telegram_stop_event
     if telegram_stop_event is not None:
+        set_telegram_flag(False)
         telegram_stop_event.set()
+        T.info("[TELEGRAM] Shutdown signal sent.")
 

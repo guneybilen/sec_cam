@@ -279,21 +279,21 @@ def run_remote_stop_detection_on_main_thread():
 
 def remote_stop_detection():
     """Gracefully stops detection WITHOUT a confirmation dialog (for remote use)."""
-    shutdown_detection_pipeline(remote=True)
+    shutdown_detection_pipeline(skip_auth=True)
 
 
 def stop_detection():
-    from PyQt5.QtWidgets import QMessageBox
+    # from PyQt5.QtWidgets import QMessageBox
     if not gui_exists():
-        shutdown_detection_pipeline(remote=False)
+        shutdown_detection_pipeline(skip_auth=False)
         return
-    answer = QMessageBox.question(main_window, "Confirm Stop", "Are you sure you want to stop detection?",
-                                  QMessageBox.Yes | QMessageBox.No)
-    if answer != QMessageBox.Yes:
-        T.info("[↩️] Stop canceled.")
-        return
+    # answer = QMessageBox.question(main_window, "Confirm Stop", "Are you sure you want to stop detection?",
+    #                              QMessageBox.Yes | QMessageBox.No)
+    # if answer != QMessageBox.Yes:
+    #     T.info("[↩️] Stop canceled.")
+    #     return
 
-    shutdown_detection_pipeline(remote=False)
+    shutdown_detection_pipeline(skip_auth=False)
 
 
 def build_gui_commands():
@@ -479,68 +479,90 @@ class MainWindow(QMainWindow):
 
         central.setLayout(layout)
         self.setCentralWidget(central)
+        
+
+    def show_sudo_failure_popup():
+        msg = QMessageBox()
+        msg.setIcon(QMessageBox.Warning)
+        msg.setWindowTitle("Authorization Failed")
+        msg.setText("Sudo authorization failed. Cannot close the application.")
+        msg.exec_()
 
     @asyncClose
     async def closeEvent(self, event: QCloseEvent) -> None:
         """
         Clean shutdown when the GUI window is closed.
         """
-        from telegram_bot import telegram_thread, stop_telegram_bot, stop_telegram_bot
+
+        from telegram_bot import telegram_thread, stop_telegram_bot
         from detection import detection_thread, release_camera_resource, shutdown_detection_pipeline
+        from detection import detection_active_event
         from main import watchdog_stop_event
 
         T.info("Closing Application...")
+        
+        # Attempt secure shutdown
+        success = shutdown_detection_pipeline(skip_auth=False)
+        print(f"[DEBUG] closeEvent triggered, shutdown success={success}")
 
-        # --- 1. Stop Telegram bot ---
-        try:
-            await stop_telegram_bot()
-            T.info("Telegram bot stopped cleanly.")
-        except (asyncio.CancelledError, RuntimeError) as e:
-            T.warning(f"Asyncio.CancelledError supressed: {e}")
-        except Exception as e:
-            T.warning(f"Telegram shutdown failed with await: {e}, trying signal...")
-            stop_telegram_bot()
+        if success:
+            # --- 1. Stop Telegram bot ---
+            try:
+                detection_active_event.clear()
+                await stop_telegram_bot()
+                T.info("Telegram bot stopped cleanly.")
+            except (asyncio.CancelledError, RuntimeError) as e:
+                T.warning(f"Asyncio.CancelledError supressed: {e}")
+            except Exception as e:
+                T.warning(f"Telegram shutdown failed with await: {e}, trying signal...")
+                stop_telegram_bot()
 
-        # --- 2. Cancel all pending asyncio tasks ---
-        current_task = asyncio.current_task()
-        tasks = [t for t in asyncio.all_tasks() if t is not current_task]
-        T.info(f"Cancelling {len(tasks)} pending asyncio tasks...")
-        for t in tasks:
-            t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+	        # --- 2. Cancel all pending asyncio tasks ---
+            # current_task = asyncio.current_task()
+            # tasks = [t for t in asyncio.all_tasks() if t is not current_task]
+            # T.info(f"Cancelling {len(tasks)} pending asyncio tasks...")
+            # for t in tasks:
+            #    t.cancel()
+            # await asyncio.gather(*tasks, return_exceptions=True)
 
-        # --- 3. Join threads ---
-        if telegram_thread and telegram_thread.is_alive():
-            telegram_thread.join(timeout=5)
+            # --- 3. Join threads ---
+            if telegram_thread and telegram_thread.is_alive():
+                telegram_thread.join(timeout=5)
 
-        if detection_thread and detection_thread.is_alive():
-            detection_thread.join(timeout=5)
+            if detection_thread and detection_thread.is_alive():
+                detection_thread.join(timeout=5)
 
-        # --- 4. Stop detection and release resources ---
-        watchdog_stop_event.set()
-        shutdown_detection_pipeline()
-        release_camera_resource()
+            # --- 4. Stop detection and release resources ---
+            watchdog_stop_event.set()
+            release_camera_resource()
 
-        prune_active_timers()
-        for t in active_timers:
-            if t.is_alive():
-                T.info(f"[TIMER] Joining active timer: {t}")
-                t.join(timeout=2)
+            prune_active_timers()
+            for t in active_timers:
+                if t.is_alive():
+                    T.info(f"[TIMER] Joining active timer: {t}")
+                    t.join(timeout=2)
 
-        shutdown_gui()
+            shutdown_gui()
 
-        T.info("[🛑] Application closed via GUI.")
-        QApplication.quit()
-        event.accept()
-        time.sleep(1)
-        T.info(f"Active threads at shutdown: {threading.enumerate()}")
+            T.info("[🛑] Application closed via GUI.")
+            event.accept()
+            time.sleep(1)
+            T.info(f"Active threads at shutdown: {threading.enumerate()}")
+
+        else:
+            T.warning("[GUI] Secure shutdown failed. Preventing GUI close.")
+            detection_active_event.set()
+            event.ignore()
+            from gui import enqueue_gui, cooldown_label
+            enqueue_gui(lambda: cooldown_label.setText("❌ Sudo failed — cannot exit"))
+            show_sudo_failure_popup()
 
 def update_telegram_status_label():
-    from telegram_bot import telegram_bot_running
+    from telegram_bot import is_telegram_running
     global telegram_status_label
-    T.info(f"[DEBUG] update_telegram_status_label called, telegram_bot_running={telegram_bot_running}")
+    T.info(f"[DEBUG] update_telegram_status_label called, is_telegram_running={is_telegram_running()}")
     if telegram_status_label:
-        if telegram_bot_running:
+        if is_telegram_running():
             telegram_status_label.setText("Telegram Bot: 🟢 Connected")
             telegram_status_label.setStyleSheet("color: green; font-weight: bold;")
         else:
@@ -633,7 +655,7 @@ async def stop_detection_command(update, context: ContextTypes.DEFAULT_TYPE):
     """Handles the /stop command."""
     from detection import detection_active_event, shutdown_detection_pipeline
     if detection_active_event.is_set():
-        shutdown_detection_pipeline(remote=True)
+        shutdown_detection_pipeline(skip_auth=True)
         await update.message.reply_text('Motion detection stopped remotely.')
     else:
         await update.message.reply_text('Motion detection is already stopped.')
@@ -643,7 +665,7 @@ async def start_detection_command(update, context: ContextTypes.DEFAULT_TYPE):
     """Handles the /start command."""
     from detection import detection_active_event, launch_detection
     if not detection_active_event.is_set():
-        launch_detection(remote=True)
+        launch_detection(skip_auth=True)
         await update.message.reply_text('Motion detection started remotely.')
     else:
         await update.message.reply_text('Motion detection is already running.')
